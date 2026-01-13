@@ -5,6 +5,8 @@ import type { SourceSubscription } from '@/lib/types';
 
 // Minimum time between syncs for the same subscription (5 minutes)
 const SYNC_COOLDOWN_MS = 5 * 60 * 1000;
+// Delay before initial sync to ensure settings are fully loaded
+const INITIAL_SYNC_DELAY_MS = 1000;
 
 export function useSubscriptionSync() {
     // Track if we've already synced during this component lifecycle
@@ -39,40 +41,50 @@ export function useSubscriptionSync() {
                 let updatedSubscriptions = [...settings.subscriptions];
                 const now = Date.now();
 
-                for (let i = 0; i < activeSubscriptions.length; i++) {
-                    const sub = activeSubscriptions[i];
+                // Filter out subscriptions that were synced recently (within cooldown period)
+                const subsToSync = activeSubscriptions.filter(
+                    (sub: SourceSubscription) => !(sub.lastUpdated && now - sub.lastUpdated < SYNC_COOLDOWN_MS)
+                );
 
-                    // Check if we synced this recently (within cooldown period) to avoid spamming
-                    if (sub.lastUpdated && now - sub.lastUpdated < SYNC_COOLDOWN_MS) {
-                        continue;
-                    }
+                if (subsToSync.length === 0) {
+                    hasSyncedRef.current = true;
+                    return;
+                }
 
-                    try {
-                        const result = await fetchSourcesFromUrl(sub.url);
+                // Fetch all subscriptions in parallel for better performance
+                const results = await Promise.allSettled(
+                    subsToSync.map((sub: SourceSubscription) => fetchSourcesFromUrl(sub.url))
+                );
 
-                        if (result.normalSources.length > 0) {
-                            currentSources = mergeSources(currentSources, result.normalSources);
+                // Process results
+                results.forEach((result, index) => {
+                    const sub = subsToSync[index];
+                    if (result.status === 'fulfilled') {
+                        const fetchResult = result.value;
+
+                        if (fetchResult.normalSources.length > 0) {
+                            currentSources = mergeSources(currentSources, fetchResult.normalSources);
                             anyChanged = true;
                         }
 
-                        if (result.premiumSources.length > 0) {
-                            currentPremiumSources = mergeSources(currentPremiumSources, result.premiumSources);
+                        if (fetchResult.premiumSources.length > 0) {
+                            currentPremiumSources = mergeSources(currentPremiumSources, fetchResult.premiumSources);
                             anyChanged = true;
                         }
 
-                        // Update timestamp
+                        // Update timestamp for successful sync
                         const subIdx = updatedSubscriptions.findIndex(s => s.id === sub.id);
                         if (subIdx !== -1) {
                             updatedSubscriptions[subIdx] = {
                                 ...updatedSubscriptions[subIdx],
                                 lastUpdated: now
                             };
-                            anyChanged = true; // Mark changed to save the updated timestamp
+                            anyChanged = true;
                         }
-                    } catch (e) {
-                        console.error(`Failed to sync subscription: ${sub.name}`, e);
+                    } else {
+                        console.error(`Failed to sync subscription: ${sub.name}`, result.reason);
                     }
-                }
+                });
 
                 if (anyChanged) {
                     settingsStore.saveSettings({
@@ -90,7 +102,7 @@ export function useSubscriptionSync() {
         };
 
         // Small delay to ensure settings are fully loaded
-        const timeoutId = setTimeout(sync, 1000);
+        const timeoutId = setTimeout(sync, INITIAL_SYNC_DELAY_MS);
         return () => clearTimeout(timeoutId);
     }, []); // Empty dependency array - only run once on mount
 }
